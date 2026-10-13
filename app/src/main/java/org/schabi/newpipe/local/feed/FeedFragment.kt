@@ -236,6 +236,7 @@ class FeedFragment : BaseStateFragment<FeedState>(), ContextualSearchable {
         super.onConfigurationChanged(newConfig)
         if (view != null) {
             GridLayoutManagerHelper.preserveScrollPosition(feedBinding.itemsList) {
+                GridLayoutManagerHelper.reinflateViewHolders(feedBinding.itemsList)
                 setupListViewMode()
                 viewModel.stateLiveData.value?.let { handleResult(it) }
             }
