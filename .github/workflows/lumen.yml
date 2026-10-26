@@ -1,0 +1,101 @@
+name: Build Lumen
+
+# Lumen = latest WizeStream release + Lumen's code (from the "lumen-src" release of this repo).
+# Runs every day to pick up new WizeStream versions, or when you tap "Run workflow".
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if nothing changed"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Get Lumen code and latest WizeStream version
+        id: up
+        run: |
+          set -euo pipefail
+          gh release download lumen-src --pattern 'Lumen-src.zip' --dir src
+          unzip -q src/Lumen-src.zip -d lumen-src
+          SRC_ID="$(sha256sum src/Lumen-src.zip | cut -c1-7)"
+          TAG="$(git ls-remote --tags --refs --sort=-v:refname https://github.com/wizdom13/WizeStream 'v*.*.*' \
+                 | awk '{print $2}' | sed 's#refs/tags/##' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)"
+          test -n "$TAG"
+          REL="lumen-${TAG#v}-${SRC_ID}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "release=$REL" >> "$GITHUB_OUTPUT"
+          if gh release view "$REL" >/dev/null 2>&1 && [ "${{ inputs.force }}" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "Already built $REL, nothing new." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get WizeStream and add Lumen
+        if: steps.up.outputs.skip == 'false'
+        run: |
+          git clone --depth 1 --branch "${{ steps.up.outputs.tag }}" https://github.com/wizdom13/WizeStream ws
+          bash lumen-src/scripts/apply-lumen.sh ws
+
+      - uses: actions/setup-java@v5
+        if: steps.up.outputs.skip == 'false'
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: gradle/actions/setup-gradle@v5
+        if: steps.up.outputs.skip == 'false'
+
+      - name: Install Android SDK parts
+        if: steps.up.outputs.skip == 'false'
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" "build-tools;36.1.0" "ndk;28.2.13676358" > /dev/null
+
+      - name: Build signed APK
+        if: steps.up.outputs.skip == 'false'
+        working-directory: ws
+        env:
+          WIZESTREAM_RELEASE_STORE_FILE: ${{ github.workspace }}/lumen-src/keys/lumen.p12
+          WIZESTREAM_RELEASE_STORE_PASSWORD: ${{ secrets.LUMEN_KEYSTORE_PASSWORD }}
+          WIZESTREAM_RELEASE_KEY_ALIAS: lumen
+          WIZESTREAM_RELEASE_KEY_PASSWORD: ${{ secrets.LUMEN_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$WIZESTREAM_RELEASE_STORE_PASSWORD" ]; then
+            echo "::error::Add the LUMEN_KEYSTORE_PASSWORD secret (Settings > Secrets and variables > Actions)."
+            exit 1
+          fi
+          ./gradlew --no-daemon :app:assembleRelease \
+            -DversionCodeOverride=$((200000000 + GITHUB_RUN_NUMBER)) \
+            -DversionNameSuffix="-lumen.${GITHUB_RUN_NUMBER}"
+
+      - name: Check and publish APK
+        if: steps.up.outputs.skip == 'false'
+        run: |
+          set -euo pipefail
+          APK="$(find ws/app/build/outputs/apk/release -name '*.apk' | head -n1)"
+          BT="$ANDROID_HOME/build-tools/36.1.0"
+          "$BT/aapt" dump badging "$APK" > badging.txt
+          grep -q "package: name='com.benhamza.lumen'" badging.txt
+          grep -q "launchable-activity: name='com.benhamza.lumen.MainActivity'" badging.txt
+          "$BT/apksigner" verify "$APK"
+          NAME="Lumen-${{ steps.up.outputs.tag }}-${GITHUB_RUN_NUMBER}.apk"
+          cp "$APK" "$NAME"
+          REL="${{ steps.up.outputs.release }}"
+          gh release delete "$REL" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$REL" "$NAME" --latest \
+            --title "Lumen build ${GITHUB_RUN_NUMBER} (WizeStream ${{ steps.up.outputs.tag }})" \
+            --notes "Install this APK over your current Lumen; your data is kept. Videos are WizeStream (GPL-3.0) by wizdom13 and the NewPipe contributors."
